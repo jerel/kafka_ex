@@ -299,6 +299,7 @@ defmodule KafkaEx.GenConsumer do
       :acked_offset,
       :last_commit,
       :auto_offset_reset,
+      :streaming_mode,
     ]
   end
 
@@ -352,6 +353,12 @@ defmodule KafkaEx.GenConsumer do
     {server_opts, consumer_opts} =
       Keyword.split(opts, [:debug, :name, :timeout, :spawn_opt])
 
+    server_opts = if Keyword.get(consumer_opts, :streaming_mode) do
+      Keyword.put_new(server_opts, :name, consumer_module)
+    else
+      server_opts
+    end
+
     GenServer.start_link(
       __MODULE__,
       {consumer_module, group_name, topic, partition, consumer_opts},
@@ -384,6 +391,34 @@ defmodule KafkaEx.GenConsumer do
     GenServer.call(gen_consumer, {:consumer_call, message}, timeout)
   end
 
+  def stream(consumer_module) do
+    Stream.resource(
+      fn -> {stream_chunk(consumer_module), nil} end,
+      fn _ -> {stream_chunk(consumer_module), nil} end,
+      fn _ -> {:halt, nil}
+    end)
+  end
+
+  defp stream_chunk(consumer_module) do
+    GenServer.call(consumer_module, :stream, :infinity)
+  end
+
+  def handle_call(:stream, from, %{consumer_module: consumer_module} = state) do
+    new_state = case consume(state) do
+      {[], state} ->
+        send(consumer_module, {:await_messages, from})
+        state
+      {message_set, state} ->
+        GenServer.reply(from, message_set)
+        state
+    end
+    {:noreply, new_state}
+  end
+
+  def handle_info({:await_messages, from}, state) do
+    handle_call(:stream, from, state)
+  end
+
   # GenServer callbacks
 
   def init({consumer_module, group_name, topic, partition, opts}) do
@@ -402,8 +437,16 @@ defmodule KafkaEx.GenConsumer do
       :auto_offset_reset,
       Application.get_env(:kafka_ex, :auto_offset_reset, @auto_offset_reset)
     )
+    streaming? = Keyword.get(
+      opts,
+      :streaming_mode,
+      false
+    )
 
-    {:ok, consumer_state} = consumer_module.init(topic, partition)
+    {:ok, consumer_state} = case streaming? do
+      true -> {:ok, nil}
+      _    -> consumer_module.init(topic, partition)
+    end
     worker_opts = Keyword.take(opts, [:uris])
     {:ok, worker_name} = KafkaEx.create_worker(
       :no_name,
@@ -420,6 +463,7 @@ defmodule KafkaEx.GenConsumer do
       group: group_name,
       topic: topic,
       partition: partition,
+      streaming_mode: streaming?,
     }
 
     Process.flag(:trap_exit, true)
@@ -427,8 +471,12 @@ defmodule KafkaEx.GenConsumer do
     {:ok, state, 0}
   end
 
-  def handle_call(:partition, _from, state) do
+  def handle_call(:partition, _from, %{streaming_mode: true} = state) do
     {:reply, {state.topic, state.partition}, state, 0}
+  end
+
+  def handle_call(:partition, _from, %{streaming_mode: false} = state) do
+    {:reply, {state.topic, state.partition}, state}
   end
 
   def handle_call(
@@ -436,7 +484,8 @@ defmodule KafkaEx.GenConsumer do
     from,
     %State{
       consumer_module: consumer_module,
-      consumer_state: consumer_state
+      consumer_state: consumer_state,
+      streaming_mode: false,
     } = state
   ) do
     # NOTE we only support the {:reply, _, _} result format here
@@ -453,18 +502,22 @@ defmodule KafkaEx.GenConsumer do
 
   def handle_info(
     :timeout,
-    %State{current_offset: nil, last_commit: nil} = state
+    %State{current_offset: nil, last_commit: nil, streaming_mode: streaming?} = state
   ) do
     new_state = %State{
       load_offsets(state) |
       last_commit: :erlang.monotonic_time(:milli_seconds)
     }
 
-    {:noreply, new_state, 0}
+    if streaming? do
+      {:noreply, new_state}
+    else
+      {:noreply, new_state, 0}
+    end
   end
 
-  def handle_info(:timeout, %State{} = state) do
-    new_state = consume(state)
+  def handle_info(:timeout, %State{streaming_mode: false} = state) do
+    {_message_set, new_state} = consume(state)
 
     {:noreply, new_state, 0}
   end
@@ -510,7 +563,7 @@ defmodule KafkaEx.GenConsumer do
 
     case response do
       %{last_offset: nil, message_set: []} ->
-        handle_commit(:async_commit, state)
+        handle_commit(:async_commit, [], state)
       %{last_offset: _, message_set: message_set} ->
         handle_message_set(message_set, state)
     end
@@ -520,11 +573,15 @@ defmodule KafkaEx.GenConsumer do
     message_set,
     %State{
       consumer_module: consumer_module,
-      consumer_state: consumer_state
+      consumer_state: consumer_state,
+      streaming_mode: streaming?
     } = state
   ) do
-    {sync_status, new_consumer_state} =
+    {sync_status, new_consumer_state} = if streaming? do
+      {:async_commit, consumer_state}
+    else
       consumer_module.handle_message_set(message_set, consumer_state)
+    end
 
     %Message{offset: last_offset} = List.last(message_set)
     state_out = %State{
@@ -534,7 +591,7 @@ defmodule KafkaEx.GenConsumer do
       current_offset: last_offset + 1
     }
 
-    handle_commit(sync_status, state_out)
+    handle_commit(sync_status, message_set, state_out)
   end
 
   defp handle_offset_out_of_range(
@@ -572,9 +629,10 @@ defmodule KafkaEx.GenConsumer do
     }
   end
 
-  defp handle_commit(:sync_commit, %State{} = state), do: commit(state)
+  defp handle_commit(:sync_commit, message_set, %State{} = state), do: {message_set, commit(state)}
   defp handle_commit(
     :async_commit,
+    message_set,
     %State{
       acked_offset: acked,
       committed_offset: committed,
@@ -583,7 +641,7 @@ defmodule KafkaEx.GenConsumer do
       commit_interval: interval
     } = state
   ) do
-    case acked - committed do
+    state = case acked - committed do
       0 ->
         %State{state | last_commit: :erlang.monotonic_time(:milli_seconds)}
       n when n >= threshold ->
@@ -595,6 +653,7 @@ defmodule KafkaEx.GenConsumer do
           state
         end
     end
+    {message_set, state}
   end
 
   defp commit(

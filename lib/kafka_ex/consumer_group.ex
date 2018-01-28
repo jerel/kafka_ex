@@ -224,6 +224,16 @@ defmodule KafkaEx.ConsumerGroup do
   end
 
   @doc """
+  Returns a list of streams, one for each consumer
+  """
+  def stream(pids) when is_list(pids), do: Enum.flat_map(pids, &stream(&1))
+  def stream(supervisor_pid) do
+    supervisor_pid
+    |> consumer_pids()
+    |> Enum.map(&GenConsumer.stream(&1))
+  end
+
+  @doc """
   Returns the name of the consumer group
   """
   @spec group_name(Supervisor.supervisor) :: binary
@@ -318,6 +328,6 @@ defmodule KafkaEx.ConsumerGroup do
   defp call_manager(supervisor_pid, call) do
     supervisor_pid
     |> get_manager_pid
-    |> GenServer.call(call)
+    |> GenServer.call(call, 30_000)
   end
 end
